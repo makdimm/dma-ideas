@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: dma-ideas
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - ADMIN_ID=7653823001
+    volumes:
+      - ideas_data:/app/data
+
+volumes:
+  ideas_data:
