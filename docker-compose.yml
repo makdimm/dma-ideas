@@ -1,6 +1,7 @@
 services:
   bot:
-    build: .
+    build:
+      context: https://github.com/makdimm/dma-ideas.git
     container_name: dma-ideas
     restart: unless-stopped
     environment:
