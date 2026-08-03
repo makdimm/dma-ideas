@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 @mytaskprogress_bot — трекер идей/дел/планов
-Фичи: текст + голос, пагинация, вкладки Открытые/Выполненные,
-спринты по датам, перенос задач на любой день, NLU-команды.
+Фичи: текст + голос, спринты по датам, перенос задач, NLU-команды.
+Интерфейс: /start = спринт на сегодня (включает все открытые задачи), минимум кнопок.
 """
 
 import asyncio
@@ -29,10 +29,9 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7653823001"))
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-PAGE_SIZE = 6
 DB_PATH = "/app/data/ideas.db"
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -79,7 +78,14 @@ def parse_date(text: str) -> str | None:
                 delta = 7
             return (today + timedelta(days=delta)).isoformat()
 
-    m = re.search(r"(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", text)
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+
+    m = re.search(r"(?<!\d)(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?", text)
     if m:
         day, month = int(m.group(1)), int(m.group(2))
         year = int(m.group(3)) if m.group(3) else today.year
@@ -89,18 +95,11 @@ def parse_date(text: str) -> str | None:
             return date(year, month, day).isoformat()
         except ValueError:
             return None
-
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text)
-    if m:
-        try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
-        except ValueError:
-            return None
     return None
 
 
 def fmt_date(due: str | None) -> str:
-    """'YYYY-MM-DD' → 'ДД.ММ' или 'сегодня'/'завтра'"""
+    """'YYYY-MM-DD' → 'ДД.ММ' / 'сегодня' / 'завтра'"""
     if not due:
         return ""
     try:
@@ -128,7 +127,6 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-    # миграция: колонка due_date
     cols = [r[1] for r in conn.execute("PRAGMA table_info(ideas)")]
     if "due_date" not in cols:
         conn.execute("ALTER TABLE ideas ADD COLUMN due_date TEXT")
@@ -196,36 +194,39 @@ def get_idea(idea_id: int) -> tuple | None:
     return row
 
 
-def get_ideas(done: int, page: int = 0) -> tuple[list[tuple], int]:
-    """(id, text, due_date) по статусу с пагинацией."""
+def get_sprint(due: str) -> list[tuple]:
+    """Задачи для спринта: на дату + (для сегодня) все открытые без даты.
+    Возвращает [(id, text, done, due_date)]"""
     conn = sqlite3.connect(DB_PATH)
-    total = conn.execute(
-        "SELECT COUNT(*) FROM ideas WHERE done = ?", (done,)
-    ).fetchone()[0]
-    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    if due == date.today().isoformat():
+        rows = conn.execute(
+            "SELECT id, text, done, due_date FROM ideas "
+            "WHERE (due_date = ? OR due_date IS NULL) AND done = 0 "
+            "ORDER BY due_date IS NOT NULL, done ASC, created_at ASC",
+            (due,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, text, done, due_date FROM ideas WHERE due_date = ? ORDER BY done ASC, created_at ASC",
+            (due,),
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_ideas(done: int) -> list[tuple]:
+    """Все задачи по статусу: [(id, text, due_date)]"""
+    conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT id, text, due_date FROM ideas WHERE done = ? "
-        "ORDER BY COALESCE(due_date, '9999-12-31') ASC, created_at DESC "
-        "LIMIT ? OFFSET ?",
-        (done, PAGE_SIZE, page * PAGE_SIZE),
-    ).fetchall()
-    conn.close()
-    return rows, total_pages
-
-
-def get_sprint(due_date: str) -> list[tuple]:
-    """Задачи на конкретную дату: [(id, text, done)]"""
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id, text, done FROM ideas WHERE due_date = ? ORDER BY done ASC, created_at ASC",
-        (due_date,),
+        "ORDER BY COALESCE(due_date, '9999-12-31') ASC, created_at DESC",
+        (done,),
     ).fetchall()
     conn.close()
     return rows
 
 
 def get_sprint_dates() -> list[str]:
-    """Все даты, на которые есть задачи (включая выполненные)"""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT DISTINCT due_date FROM ideas WHERE due_date IS NOT NULL ORDER BY due_date"
@@ -278,7 +279,7 @@ def parse_intent(text: str) -> dict:
     if m:
         return {"action": "undone", "id": int(m.group(1))}
 
-    # 4. Спринт: «спринт», «что на завтра», «план на пятницу», «задачи на 05.08», «на сегодня»
+    # 4. Спринт: «спринт», «что на завтра», «план на пятницу», «на сегодня»
     if (re.search(r"(?:спринт|что\s+на|план\s+на|задачи\s+на|дела\s+на|покажи\s+на)", t)
             or t in ("сегодня", "завтра", "послезавтра")
             or re.match(r"^на\s+(.+)$", t)):
@@ -297,7 +298,7 @@ def parse_intent(text: str) -> dict:
     if re.search(r"(?:все\s+задачи|все\s+дела|покажи\s+все|список)", t):
         return {"action": "all"}
 
-    # 6. Добавить с датой: «добавь купить хлеб на завтра», «запиши ... на пятницу»
+    # 6. Добавить с датой: «добавь купить хлеб на завтра»
     m = re.search(r"(?:добавь|добавить|запиши|новая\s+задача|задача)\s+(.+)", t)
     if m:
         body = m.group(1).strip()
@@ -316,253 +317,130 @@ def parse_intent(text: str) -> dict:
 
 # ─── КЛАВИАТУРЫ ───────────────────────────────────────────────
 
-def _page_nav(tab: str, page: int, total_pages: int):
-    btns = []
-    if page > 0:
-        btns.append(InlineKeyboardButton(text="◀️", callback_data=f"page:{tab}:{page - 1}"))
-    btns.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
-    if page < total_pages - 1:
-        btns.append(InlineKeyboardButton(text="▶️", callback_data=f"page:{tab}:{page + 1}"))
-    return btns
-
-
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Спринт на сегодня", callback_data="sprint:today")],
-        [InlineKeyboardButton(text="📚 Все задачи", callback_data="tab:open")],
-        [InlineKeyboardButton(text="✅ Выполненные", callback_data="tab:done")],
-        [InlineKeyboardButton(text="➕ Добавить задачу", callback_data="add_prompt")],
-    ])
-
-
-def _task_buttons(idea_id: int, page: int) -> list[InlineKeyboardButton]:
-    return [
-        InlineKeyboardButton(text="📅", callback_data=f"move_pick:{idea_id}:{page}"),
-        InlineKeyboardButton(text="🗑", callback_data=f"delete:{idea_id}:{page}"),
-    ]
-
-
-def open_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    rows, total_pages = get_ideas(0, page)
-    kb = []
-
-    kb.append([
-        InlineKeyboardButton(text="👉 📋 Открытые 👈", callback_data="noop"),
-        InlineKeyboardButton(text="✅ Выполненные", callback_data="tab:done"),
-    ])
-
-    if not rows:
-        kb.append([InlineKeyboardButton(text="➕ Добавить задачу", callback_data="add_prompt")])
-    else:
-        for idea_id, text, due in rows:
-            short = text[:45] + ("…" if len(text) > 45 else "")
-            label = f"⬜  {short}"
-            if due:
-                label = f"⬜  [{fmt_date(due)}] {short}"
-            kb.append([
-                InlineKeyboardButton(text=label, callback_data=f"toggle:{idea_id}:{page}"),
-                *_task_buttons(idea_id, page),
-            ])
-        if total_pages > 1:
-            kb.append(_page_nav("open", page, total_pages))
-        kb.append([
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"refresh:{page}"),
+def sprint_keyboard(due: str) -> InlineKeyboardMarkup:
+    kb = [
+        [
             InlineKeyboardButton(text="➕ Добавить", callback_data="add_prompt"),
-            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_mode:{page}"),
-        ])
+            InlineKeyboardButton(text="📚 Все задачи", callback_data="all"),
+        ],
+        [
+            InlineKeyboardButton(text="📅 Сегодня", callback_data="sprint:today"),
+            InlineKeyboardButton(text="📅 Завтра", callback_data="sprint:tomorrow"),
+            InlineKeyboardButton(text="📅 Послезавтра", callback_data="sprint:dayafter"),
+        ],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def done_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    rows, total_pages = get_ideas(1, page)
+def all_keyboard(done: int = 0) -> InlineKeyboardMarkup:
     kb = []
-
-    kb.append([
-        InlineKeyboardButton(text="📋 Открытые", callback_data="tab:open"),
-        InlineKeyboardButton(text="👉 ✅ Выполненные 👈", callback_data="noop"),
-    ])
-
-    if not rows:
-        kb.append([InlineKeyboardButton(text="— пока ничего нет —", callback_data="noop")])
-    else:
-        for idea_id, text, due in rows:
-            short = text[:45] + ("…" if len(text) > 45 else "")
-            label = f"✅  {short}"
-            if due:
-                label = f"✅  [{fmt_date(due)}] {short}"
-            kb.append([
-                InlineKeyboardButton(text=label, callback_data=f"toggle:{idea_id}:{page}"),
-                *_task_buttons(idea_id, page),
-            ])
-        if total_pages > 1:
-            kb.append(_page_nav("done", page, total_pages))
+    if done:
         kb.append([
             InlineKeyboardButton(text="🗑 Очистить все", callback_data="clear_done"),
-            InlineKeyboardButton(text="◀️ Назад", callback_data="tab:open"),
         ])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-def delete_keyboard(page: int = 0) -> InlineKeyboardMarkup:
-    rows, total_pages = get_ideas(0, page)
-    if not rows:
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Назад к задачам", callback_data="tab:open")]
-            ]
-        )
-
-    kb = [
-        [InlineKeyboardButton(text="◀️ Назад к задачам", callback_data="tab:open")]
-    ]
-    for idea_id, text, due in rows:
-        short = text[:30] + ("…" if len(text) > 30 else "")
-        if due:
-            short = f"[{fmt_date(due)}] {short}"
-        kb.append([
-            InlineKeyboardButton(text=f"❌  {short}", callback_data=f"delete:{idea_id}:{page}")
-        ])
-    if total_pages > 1:
-        kb.append(_page_nav("delete", page, total_pages))
-    kb.append([InlineKeyboardButton(text="◀️ Назад к задачам", callback_data="tab:open")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-def sprint_keyboard(due: str) -> InlineKeyboardMarkup:
-    rows = get_sprint(due)
-    kb = []
-    if not rows:
-        kb.append([InlineKeyboardButton(text="— пусто —", callback_data="noop")])
-    else:
-        for idea_id, text, done in rows:
-            short = text[:45] + ("…" if len(text) > 45 else "")
-            mark = "✅" if done else "⬜"
-            kb.append([
-                InlineKeyboardButton(
-                    text=f"{mark}  {short}",
-                    callback_data=f"toggle:{idea_id}:0",
-                ),
-                *_task_buttons(idea_id, 0),
-            ])
     kb.append([
-        InlineKeyboardButton(text="📅 Сегодня", callback_data="sprint:today"),
-        InlineKeyboardButton(text="📅 Завтра", callback_data="sprint:tomorrow"),
-    ])
-    kb.append([
-        InlineKeyboardButton(text="📅 Послезавтра", callback_data="sprint:dayafter"),
-        InlineKeyboardButton(text="🗓 Другая дата", callback_data="sprint_pick_date"),
-    ])
-    kb.append([
-        InlineKeyboardButton(text="📚 Все задачи", callback_data="tab:open"),
         InlineKeyboardButton(text="➕ Добавить", callback_data="add_prompt"),
-        InlineKeyboardButton(text="🏠 Меню", callback_data="menu"),
+        InlineKeyboardButton(text="🏠 На сегодня", callback_data="sprint:today"),
     ])
+    if done:
+        kb.append([InlineKeyboardButton(text="📋 Открытые", callback_data="tab:open")])
+    else:
+        kb.append([InlineKeyboardButton(text="✅ Выполненные", callback_data="tab:done")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
-def sprint_pick_keyboard() -> InlineKeyboardMarkup:
-    """Выбор даты из существующих спринтов + быстрое меню"""
-    dates = get_sprint_dates()
-    kb = []
-    for d in dates:
-        kb.append([InlineKeyboardButton(text=f"🗓 {fmt_date(d)}", callback_data=f"sprint:{d}")])
-    kb.append([
-        InlineKeyboardButton(text="📅 Сегодня", callback_data="sprint:today"),
-        InlineKeyboardButton(text="📅 Завтра", callback_data="sprint:tomorrow"),
-    ])
-    kb.append([InlineKeyboardButton(text="🏠 Меню", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-def move_pick_keyboard(idea_id: int, page: int = 0) -> InlineKeyboardMarkup:
+def move_pick_keyboard(idea_id: int) -> InlineKeyboardMarkup:
     today = date.today()
     kb = [
         [InlineKeyboardButton(text="📅 Сегодня", callback_data=f"move_set:{idea_id}:{today.isoformat()}")],
         [InlineKeyboardButton(text="📅 Завтра", callback_data=f"move_set:{idea_id}:{(today + timedelta(days=1)).isoformat()}")],
         [InlineKeyboardButton(text="📅 Послезавтра", callback_data=f"move_set:{idea_id}:{(today + timedelta(days=2)).isoformat()}")],
-        [InlineKeyboardButton(text="✏️ Написать дату", callback_data=f"move_type:{idea_id}:{page}")],
+        [InlineKeyboardButton(text="✏️ Написать дату", callback_data=f"move_type:{idea_id}")],
         [InlineKeyboardButton(text="🚫 Без даты", callback_data=f"move_set:{idea_id}:none")],
-        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"move_back:{page}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="sprint:today")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 
 # ─── VIEWS ─────────────────────────────────────────────────────
 
-def _header() -> str:
-    open_c, done_c = count_ideas()
-    return (
-        f"📋 <b>Мои идеи / дела / планы</b>\n"
-        f"└ {open_c + done_c} всего · {done_c} ✅ выполнено\n\n"
-    )
-
-
-async def show_tab(msg_or_call, tab: str, page: int = 0, edit: bool = False):
-    header = _header()
-    if tab == "open":
-        text = header + "<b>📋 Открытые задачи</b>\n(нажми на задачу — отметишь ✅, 📅 — перенести)"
-        markup = open_keyboard(page)
-    else:
-        text = header + "<b>✅ Выполненные</b>"
-        markup = done_keyboard(page)
-
-    if edit:
-        await msg_or_call.edit_text(text, reply_markup=markup)
-    else:
-        await msg_or_call.answer(text, reply_markup=markup)
+def _sprint_text(due: str) -> tuple[str, list]:
+    rows = get_sprint(due)
+    label = fmt_date(due)
+    if not rows:
+        return f"🏃 <b>Спринт на {label}</b>\n\nПока пусто. Добавь задачу или перенеси 📅", []
+    open_n = sum(1 for _, _, d, _ in rows if not d)
+    done_n = len(rows) - open_n
+    lines = [f"🏃 <b>Спринт на {label}</b>", f"└ {len(rows)} задач · {done_n} ✅", ""]
+    for idea_id, t, done, due in rows:
+        mark = "✅" if done else "⬜"
+        lines.append(f"{mark} <b>#{idea_id}</b> {t}")
+    return "\n".join(lines), rows
 
 
 async def show_sprint(msg_or_call, due: str, edit: bool = False):
-    rows = get_sprint(due)
-    label = fmt_date(due)
-    if rows:
-        open_n = sum(1 for _, _, d in rows if not d)
-        done_n = len(rows) - open_n
-        text = (
-            f"🏃 <b>Спринт на {label}</b>\n"
-            f"└ {len(rows)} задач · {done_n} ✅ выполнено\n\n"
-        )
-        for idea_id, t, done in rows:
-            mark = "✅" if done else "⬜"
-            text += f"{mark} <b>#{idea_id}</b> {t}\n"
-    else:
-        text = f"🏃 <b>Спринт на {label}</b>\n\nПока пусто. Добавь задачу или перенеси сюда 📅"
+    text, rows = _sprint_text(due)
+    kb = sprint_keyboard(due)
+    # кнопки задач: вставляем после заголовка (в начало клавиатуры)
+    task_btns = []
+    for idea_id, t, done, _due in rows:
+        mark = "✅" if done else "⬜"
+        short = t[:42] + ("…" if len(t) > 42 else "")
+        task_btns.append([
+            InlineKeyboardButton(text=f"{mark} {short}", callback_data=f"toggle:{idea_id}"),
+            InlineKeyboardButton(text="📅", callback_data=f"move_pick:{idea_id}"),
+        ])
+    full_kb = InlineKeyboardMarkup(inline_keyboard=task_btns + kb.inline_keyboard)
 
     if edit:
-        await msg_or_call.edit_text(text, reply_markup=sprint_keyboard(due))
+        await msg_or_call.edit_text(text, reply_markup=full_kb)
     else:
-        await msg_or_call.answer(text, reply_markup=sprint_keyboard(due))
+        await msg_or_call.answer(text, reply_markup=full_kb)
+
+
+async def show_all(msg_or_call, done: int = 0, edit: bool = False):
+    rows = get_ideas(done)
+    open_c, done_c = count_ideas()
+    if done:
+        header = f"✅ <b>Выполненные</b>\n└ {done_c} шт\n\n"
+    else:
+        header = f"📚 <b>Все задачи</b>\n└ {open_c} открыто · {done_c} ✅\n\n"
+
+    if not rows:
+        text = header + "— пусто —"
+        kb = all_keyboard(done)
+    else:
+        lines = []
+        task_btns = []
+        for idea_id, t, due in rows:
+            mark = "✅" if done else "⬜"
+            tag = f"[{fmt_date(due)}] " if due else ""
+            lines.append(f"{mark} <b>#{idea_id}</b> {tag}{t}")
+            short = t[:42] + ("…" if len(t) > 42 else "")
+            label = f"{mark} {tag}{short}"
+            task_btns.append([
+                InlineKeyboardButton(text=label, callback_data=f"toggle:{idea_id}"),
+                InlineKeyboardButton(text="📅", callback_data=f"move_pick:{idea_id}"),
+            ])
+        text = header + "\n".join(lines)
+        kb = InlineKeyboardMarkup(inline_keyboard=task_btns + all_keyboard(done).inline_keyboard)
+
+    if edit:
+        await msg_or_call.edit_text(text, reply_markup=kb)
+    else:
+        await msg_or_call.answer(text, reply_markup=kb)
 
 
 # ─── HANDLERS: КОМАНДЫ ─────────────────────────────────────────
 
-@dp.message(Command("start", "menu"))
-async def cmd_start(msg: types.Message):
+@dp.message(Command("start", "menu", "sprint"))
+async def cmd_sprint(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         await msg.reply("⛔ Нет доступа")
         return
-    open_c, done_c = count_ideas()
-    await msg.answer(
-        _header()
-        + "🏠 <b>Главное меню</b>\n\n"
-        "Что умею:\n"
-        "• /sprint — спринт на сегодня\n"
-        "• /sprint завтра — на завтра\n"
-        "• /all — все задачи\n"
-        "• /done 3 — отметить выполненной\n"
-        "• /undone 3 — вернуть в работу\n"
-        "• /move 3 на пятницу — перенести\n"
-        "• Просто текст — новая задача\n"
-        "• «спринт», «что на завтра», «отметь 3» — тоже понимаю",
-        reply_markup=main_menu_keyboard(),
-    )
-
-
-@dp.message(Command("sprint"))
-async def cmd_sprint(msg: types.Message):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    arg = msg.text.replace("/sprint", "", 1).strip()
+    arg = msg.text.split(" ", 1)[1] if " " in msg.text else ""
+    if msg.text.startswith("/start") or msg.text.startswith("/menu"):
+        arg = ""
     due = parse_date(arg) if arg else date.today().isoformat()
     if not due:
         due = date.today().isoformat()
@@ -573,7 +451,7 @@ async def cmd_sprint(msg: types.Message):
 async def cmd_all(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-    await show_tab(msg, "open")
+    await show_all(msg, 0)
 
 
 @dp.message(Command("done"))
@@ -640,19 +518,11 @@ async def cmd_move(msg: types.Message):
 async def cmd_remind(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-    conn = sqlite3.connect(DB_PATH)
-    open_list = conn.execute(
-        "SELECT id, text, due_date FROM ideas WHERE done = 0 ORDER BY COALESCE(due_date, '9999-12-31') ASC, created_at DESC"
-    ).fetchall()
-    done_list = conn.execute(
-        "SELECT id, text, due_date FROM ideas WHERE done = 1 ORDER BY created_at DESC"
-    ).fetchall()
-    conn.close()
-
+    open_list = get_ideas(0)
+    done_list = get_ideas(1)
     if not open_list and not done_list:
         await msg.answer("📋 Пока ни одной задачи. Добавь через /start")
         return
-
     parts = []
     if open_list:
         items = []
@@ -663,7 +533,6 @@ async def cmd_remind(msg: types.Message):
     if done_list:
         items = "\n".join(f"✅ {t}" for _, t, _ in done_list)
         parts.append(f"\n✅ <b>Выполнено:</b>\n{items}")
-
     await msg.answer("\n\n".join(parts))
 
 
@@ -672,14 +541,22 @@ async def cmd_cancel(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
     _pending_move.pop(msg.from_user.id, None)
-    await show_tab(msg, "open")
+    await show_sprint(msg, date.today().isoformat())
 
 
 @dp.message(Command("help"))
 async def cmd_help(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-    await cmd_start(msg)
+    await msg.answer(
+        "🏠 <b>Как пользоваться</b>\n\n"
+        "• /start — спринт на сегодня (все открытые задачи)\n"
+        "• /all — все задачи, /remind — сводка\n"
+        "• /done 3, /undone 3 — отметить / вернуть\n"
+        "• /move 3 на пятницу — перенести\n"
+        "• Просто текст — новая задача («купить хлеб на завтра»)\n"
+        "• «отметь 3», «что на завтра» — тоже понимаю"
+    )
 
 
 # ─── HANDLERS: CALLBACKS ───────────────────────────────────────
@@ -689,18 +566,16 @@ async def noop(call: types.CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query(lambda c: c.data == "menu")
-async def go_menu(call: types.CallbackQuery):
-    open_c, done_c = count_ideas()
-    await call.message.edit_text(
-        _header()
-        + "🏠 <b>Главное меню</b>\n\n"
-        "• 📋 Спринт на сегодня\n"
-        "• 📚 Все задачи\n"
-        "• ✅ Выполненные\n"
-        "• ➕ Добавить задачу",
-        reply_markup=main_menu_keyboard(),
-    )
+@dp.callback_query(lambda c: c.data == "all")
+async def cb_all(call: types.CallbackQuery):
+    await show_all(call.message, 0, edit=True)
+    await call.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("tab:"))
+async def switch_tab(call: types.CallbackQuery):
+    tab = call.data.split(":")[1]
+    await show_all(call.message, 1 if tab == "done" else 0, edit=True)
     await call.answer()
 
 
@@ -719,21 +594,24 @@ async def handle_sprint(call: types.CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query(lambda c: c.data == "sprint_pick_date")
-async def sprint_pick_date(call: types.CallbackQuery):
-    await call.message.edit_text(
-        "🗓 <b>Выбери дату спринта</b>",
-        reply_markup=sprint_pick_keyboard(),
-    )
-    await call.answer()
+@dp.callback_query(lambda c: c.data.startswith("toggle:"))
+async def handle_toggle(call: types.CallbackQuery):
+    idea_id = int(call.data.split(":")[1])
+    result = toggle_idea(idea_id)
+    if result is None:
+        await call.answer("❌ Задача не найдена", show_alert=True)
+        return
+    # возвращаемся на текущий экран (спринт сегодня)
+    await show_sprint(call.message, date.today().isoformat(), edit=True)
+    await call.answer("✅" if result else "⬜")
 
 
 @dp.callback_query(lambda c: c.data.startswith("move_pick:"))
 async def move_pick(call: types.CallbackQuery):
-    _, idea_id, page = call.data.split(":")
+    idea_id = int(call.data.split(":")[1])
     await call.message.edit_text(
         f"📅 <b>Перенос задачи #{idea_id}</b>\nКуда?",
-        reply_markup=move_pick_keyboard(int(idea_id), int(page)),
+        reply_markup=move_pick_keyboard(idea_id),
     )
     await call.answer()
 
@@ -754,8 +632,8 @@ async def move_set(call: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data.startswith("move_type:"))
 async def move_type(call: types.CallbackQuery):
-    _, idea_id, page = call.data.split(":")
-    _pending_move[call.from_user.id] = int(idea_id)
+    idea_id = int(call.data.split(":")[1])
+    _pending_move[call.from_user.id] = idea_id
     await call.message.edit_text(
         f"✏️ Напиши дату для задачи #{idea_id}:\n"
         "<i>пятница</i>, <i>12.08</i>, <i>завтра</i>, <i>послезавтра</i>…",
@@ -763,98 +641,14 @@ async def move_type(call: types.CallbackQuery):
     await call.answer()
 
 
-@dp.callback_query(lambda c: c.data.startswith("move_back:"))
-async def move_back(call: types.CallbackQuery):
-    page = int(call.data.split(":")[1])
-    await show_tab(call.message, "open", page, edit=True)
-    await call.answer()
-
-
-@dp.callback_query(lambda c: c.data.startswith("refresh:"))
-async def handle_refresh(call: types.CallbackQuery):
-    page = int(call.data.split(":")[1])
-    await show_tab(call.message, "open", page, edit=True)
-    await call.answer("🔄 Обновлено")
-
-
-@dp.callback_query(lambda c: c.data.startswith("tab:"))
-async def switch_tab(call: types.CallbackQuery):
-    tab = call.data.split(":")[1]
-    await show_tab(call.message, tab, page=0, edit=True)
-    await call.answer()
-
-
-@dp.callback_query(lambda c: c.data.startswith("page:"))
-async def handle_page(call: types.CallbackQuery):
-    _, tab, page = call.data.split(":")
-    page = int(page)
-    if tab == "delete":
-        await call.message.edit_reply_markup(reply_markup=delete_keyboard(page))
-    else:
-        await show_tab(call.message, tab, page, edit=True)
-    await call.answer()
-
-
-@dp.callback_query(lambda c: c.data.startswith("toggle:"))
-async def handle_toggle(call: types.CallbackQuery):
-    parts = call.data.split(":")
-    idea_id = int(parts[1])
-    page = int(parts[2]) if len(parts) > 2 else 0
-    result = toggle_idea(idea_id)
-    if result is None:
-        await call.answer("❌ Задача не найдена", show_alert=True)
-        return
-    await call.message.delete()
-    tab = "done" if result else "open"
-    await show_tab(call.message, tab, page)
-    await call.answer()
-
-
 @dp.callback_query(lambda c: c.data == "add_prompt")
 async def ask_add(call: types.CallbackQuery):
     await call.message.answer(
-        "✏️ <b>Напиши текст</b> или отправь <b>голосовое</b>\n\n"
-        "Обычное сообщение или голосовое — и оно станет новой задачей.\n"
-        "Можно сразу с датой: <i>купить хлеб на завтра</i>\n"
+        "✏️ <b>Напиши текст</b> — станет задачей.\n"
+        "Можно сразу с датой: <i>купить хлеб на завтра</i>.\n"
         "Нажми /cancel чтобы отменить."
     )
     await call.answer()
-
-
-@dp.callback_query(lambda c: c.data.startswith("delete_mode:"))
-async def enter_delete_mode(call: types.CallbackQuery):
-    page = int(call.data.split(":")[1])
-    await call.message.edit_text(
-        "🗑 <b>Режим удаления</b>\n\nНажми на задачу, чтобы удалить её.",
-        reply_markup=delete_keyboard(page),
-    )
-    await call.answer()
-
-
-@dp.callback_query(lambda c: c.data.startswith("delete:"))
-async def handle_delete(call: types.CallbackQuery):
-    parts = call.data.split(":")
-    idea_id = int(parts[1])
-    page = int(parts[2]) if len(parts) > 2 else 0
-    delete_idea(idea_id)
-    await call.answer("✅ Удалено", show_alert=False)
-
-    rows, _ = get_ideas(0, page)
-    if rows:
-        await call.message.edit_reply_markup(reply_markup=delete_keyboard(page))
-    else:
-        total_open, _ = count_ideas()
-        if total_open > 0 and page > 0:
-            new_page = page - 1
-            rows, _ = get_ideas(0, new_page)
-            if rows:
-                await call.message.edit_reply_markup(reply_markup=delete_keyboard(new_page))
-            else:
-                await call.message.delete()
-                await show_tab(call.message, "open")
-        else:
-            await call.message.delete()
-            await show_tab(call.message, "open")
 
 
 @dp.callback_query(lambda c: c.data == "clear_done")
@@ -864,8 +658,7 @@ async def handle_clear_done(call: types.CallbackQuery):
     conn.commit()
     conn.close()
     await call.answer("✅ Все выполненные удалены", show_alert=True)
-    await call.message.delete()
-    await show_tab(call.message, "open")
+    await show_sprint(call.message, date.today().isoformat(), edit=True)
 
 
 # ─── HANDLERS: ГОЛОС И ТЕКСТ ───────────────────────────────────
@@ -874,20 +667,16 @@ async def handle_clear_done(call: types.CallbackQuery):
 async def handle_voice(msg: types.Message):
     if msg.from_user.id != ADMIN_ID:
         return
-
     if not ai_client:
         await msg.reply("❌ Голосовые не поддерживаются — нет OpenAI API ключа")
         return
-
     await bot.send_chat_action(msg.chat.id, "typing")
-
     try:
         file = await bot.get_file(msg.voice.file_id)
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
         buf.seek(0)
         buf.name = "voice.ogg"
-
         transcript = await ai_client.audio.transcriptions.create(
             model="whisper-1",
             file=buf,
@@ -895,35 +684,29 @@ async def handle_voice(msg: types.Message):
         )
         text = transcript.text.strip()
         logger.info("Голос распознан: %r", text[:80])
-
         if not text:
             await msg.reply("❌ Не удалось распознать речь. Попробуй ещё раз.")
             return
-
         intent = parse_intent(text)
         if intent["action"] == "add":
             idea_id = add_idea(intent["text"], intent.get("date"))
             due_label = f" на {fmt_date(intent['date'])}" if intent.get("date") else ""
-            logger.info("Добавлена идея #%s (голос): %s", idea_id, text[:60])
-            await msg.answer(f"🎤 <b>Распознано и добавлено!</b> #{idea_id}{due_label}\n\n{intent['text']}")
+            await msg.answer(f"🎤 <b>Добавлено!</b> #{idea_id}{due_label}\n\n{intent['text']}")
         else:
             await msg.answer(f"🎤 <b>Распознано:</b> {text}")
             await _apply_intent(msg, intent)
-
     except Exception as e:
         logger.exception("Voice processing error")
         await msg.reply(f"❌ Ошибка обработки голоса: {e}")
-
-    await show_tab(msg, "open")
+    await show_sprint(msg, date.today().isoformat())
 
 
 async def _apply_intent(msg: types.Message, intent: dict):
-    """Применяет NLU-интент, отвечает результатом."""
     action = intent["action"]
     if action == "sprint":
         await show_sprint(msg, intent["date"])
     elif action == "all":
-        await show_tab(msg, "open")
+        await show_all(msg, 0)
     elif action == "done":
         idea_id = intent["id"]
         if set_done(idea_id, True):
@@ -966,10 +749,8 @@ async def handle_text(msg: types.Message):
         return
     if msg.text.startswith("/"):
         return
-
     text = msg.text.strip()
 
-    # Если ждём дату для переноса
     pending_id = _pending_move.pop(msg.from_user.id, None)
     if pending_id is not None:
         due = parse_date(text)
@@ -998,10 +779,8 @@ async def main():
     init_db()
     if ai_client:
         logger.info("🎤 Голосовые сообщения включены (OpenAI Whisper)")
-    elif not _openai_available:
-        logger.warning("🎤 Голосовые отключены — пакет openai не установлен")
     else:
-        logger.warning("🎤 Голосовые отключены — нет OPENAI_API_KEY")
+        logger.warning("🎤 Голосовые отключены — нет OpenAI API ключа/пакета")
     logger.info("🤖 @mytaskprogress_bot запущен")
     await dp.start_polling(bot)
 
