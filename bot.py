@@ -195,21 +195,14 @@ def get_idea(idea_id: int) -> tuple | None:
 
 
 def get_sprint(due: str) -> list[tuple]:
-    """Задачи для спринта: на дату + (для сегодня) все открытые без даты.
-    Возвращает [(id, text, done, due_date)]"""
+    """Задачи для спринта на конкретную дату: [(id, text, done, due_date)]
+    Только задачи с этой датой — общий список (без даты) в спринт не попадает."""
     conn = sqlite3.connect(DB_PATH)
-    if due == date.today().isoformat():
-        rows = conn.execute(
-            "SELECT id, text, done, due_date FROM ideas "
-            "WHERE (due_date = ? OR due_date IS NULL) AND done = 0 "
-            "ORDER BY due_date IS NOT NULL, done ASC, created_at ASC",
-            (due,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, text, done, due_date FROM ideas WHERE due_date = ? ORDER BY done ASC, created_at ASC",
-            (due,),
-        ).fetchall()
+    rows = conn.execute(
+        "SELECT id, text, done, due_date FROM ideas "
+        "WHERE due_date = ? ORDER BY done ASC, created_at ASC",
+        (due,),
+    ).fetchall()
     conn.close()
     return rows
 
