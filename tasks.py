@@ -192,7 +192,7 @@ def cmd_add(text: str, due: str | None):
 import sqlite3, json
 from datetime import datetime
 conn = sqlite3.connect('{DB_PATH}')
-cur = conn.execute("INSERT INTO ideas (text, done, created_at, due_date) VALUES (?,0,?,?)", ({json.dumps(text)}, datetime.now().isoformat(), {json.dumps(due)}))
+cur = conn.execute("INSERT INTO ideas (text, done, created_at, due_date) VALUES (?,0,?,?)", ({json.dumps(text)}, datetime.now().isoformat(), {repr(due)}))
 conn.commit()
 print(json.dumps({{"id": cur.lastrowid}}, ensure_ascii=False))
 conn.close()

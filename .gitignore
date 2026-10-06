@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 *.db
+*.bak
+*.bak-*
+*.bak.*
+.env.bak*
+.env.restored
